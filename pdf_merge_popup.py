@@ -112,6 +112,9 @@ if IS_WINDOWS:
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR,
                                        ctypes.c_int]
     _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +157,12 @@ def parse_page_range(spec: str, num_pages: int):
 # Open-PDF detection (Windows only; harmless no-ops elsewhere)
 # ---------------------------------------------------------------------------
 def _enum_window_pdf_titles():
-    """Return set of pdf filenames pulled from visible window titles."""
+    """Return PDF filenames and owning process IDs from visible window titles."""
     names = set()
     raw_titles = []
+    pids = set()
     if not IS_WINDOWS:
-        return names
+        return names, pids
 
     def cb(hwnd, _):
         try:
@@ -173,6 +177,10 @@ def _enum_window_pdf_titles():
             if ".pdf" not in title.lower():
                 return True
             raw_titles.append(title)
+            pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                pids.add(pid.value)
             for m in re.finditer(r"([^\\/:*?\"<>|\r\n]+?\.pdf)", title, re.I):
                 name = m.group(1).strip().strip("-–— ").strip()
                 name = re.sub(r"^.*?[-–—]\s+(?=[^-]*\.pdf$)", "", name,
@@ -187,8 +195,9 @@ def _enum_window_pdf_titles():
     if not ok:
         log(f"EnumWindows returned FALSE, GetLastError="
             f"{ctypes.get_last_error()}")
-    log(f"tier1 titles: raw={raw_titles!r} -> parsed={sorted(names)!r}")
-    return names
+    log(f"tier1 titles: raw={raw_titles!r} -> parsed={sorted(names)!r}, "
+        f"pids={sorted(pids)!r}")
+    return names, pids
 
 
 # Once a path is resolved during this session, remember it — psutil's
@@ -214,7 +223,7 @@ def _pdfs_from_proc(proc):
     return found
 
 
-def _paths_from_process_handles():
+def _paths_from_process_handles(extra_pids=None):
     """Return dict {filename_lower: full_path} from PDF viewers' open handles.
     Bounded by HANDLE_SCAN_BUDGET so it can never hang the app."""
     paths = {}
@@ -226,17 +235,18 @@ def _paths_from_process_handles():
         log("tier2: psutil not installed")
         return paths
     deadline = time.monotonic() + HANDLE_SCAN_BUDGET
+    extra_pids = set(extra_pids or ())
     scanned = []
     for proc in psutil.process_iter(["name", "pid"]):
         if time.monotonic() > deadline:
             log("tier2: hit time budget, stopping early")
             break
-        if not _is_pdf_viewer_proc(proc.info["name"]):
+        if (proc.info["pid"] not in extra_pids and
+                not _is_pdf_viewer_proc(proc.info["name"])):
             continue
-        scanned.append(proc.info["name"])
+        scanned.append(f"{proc.info['name']}[{proc.info['pid']}]")
         try:
             paths.update(_pdfs_from_proc(proc))
-            continue
         except psutil.AccessDenied:
             log(f"tier2: {proc.info['name']} AccessDenied — retrying "
                 "with fresh handle")
@@ -248,10 +258,12 @@ def _paths_from_process_handles():
             time.sleep(0.25)
             paths.update(_pdfs_from_proc(psutil.Process(proc.info["pid"])))
             log("tier2: retry succeeded")
-            continue
         except Exception as e:
             log(f"tier2: retry failed -> {type(e).__name__}")
-        # last resort: PDFs passed on the command line (double-click opens)
+        # Last resort: PDFs passed on the command line (double-click opens).
+        # Do this even after a successful open_files() call because some PDF
+        # viewers stop exposing file handles after save/merge operations while
+        # still keeping the source document path in their command line.
         try:
             for arg in proc.cmdline():
                 if arg.lower().endswith(".pdf") and os.path.isfile(arg):
@@ -306,13 +318,14 @@ def detect_open_pdfs():
     Each tier is isolated — one failing can't blank the others."""
     log("=== scan start ===")
     try:
-        titles = _enum_window_pdf_titles()
+        titles, title_pids = _enum_window_pdf_titles()
     except Exception:
         import traceback
         log("tier1 CRASH:\n" + traceback.format_exc())
         titles = set()
+        title_pids = set()
     try:
-        handle_paths = _paths_from_process_handles()
+        handle_paths = _paths_from_process_handles(title_pids)
     except Exception:
         import traceback
         log("tier2 CRASH:\n" + traceback.format_exc())
@@ -328,9 +341,11 @@ def detect_open_pdfs():
     results = []
     for name in sorted(titles, key=str.lower):
         key = name.lower()
-        path = handle_paths.get(key) or recent_paths.get(key)
+        path = (handle_paths.get(key) or _SESSION_PATH_CACHE.get(key) or
+                recent_paths.get(key))
         results.append({"name": name, "path": path, "section": "open",
                         "source": "handles" if key in handle_paths
+                                  else "session" if key in _SESSION_PATH_CACHE
                                   else "recent" if key in recent_paths
                                   else None})
     # Also surface handle-detected PDFs whose window title didn't parse
@@ -808,10 +823,11 @@ class MergeApp:
             writer = PdfWriter()
             total = 0
             for path, indices in plan:
-                reader = PdfReader(path)
-                for i in indices:
-                    writer.add_page(reader.pages[i])
-                    total += 1
+                with open(path, "rb") as source:
+                    reader = PdfReader(source)
+                    for i in indices:
+                        writer.add_page(reader.pages[i])
+                        total += 1
             with open(out, "wb") as fh:
                 writer.write(fh)
         except Exception as e:
