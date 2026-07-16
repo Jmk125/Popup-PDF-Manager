@@ -20,6 +20,15 @@ pyinstaller --noconsole --onefile --name PDFMergePopup pdf_merge_popup.py
 
 Output lands in `dist\PDFMergePopup.exe`. Drop a shortcut in `shell:startup` if you want it running on login.
 
+## If it disappears or the hotkey stops working
+
+The windowed build has no console, so startup and hotkey failures are written to
+`pdfmerge_debug.log` beside the executable. Use the **Log** link in the app, or
+open that file directly after a failure. The app now also keeps the window open
+with a status message if Windows or a security policy prevents the `keyboard`
+hook from registering; it does not silently leave you with a hidden window and
+no working hotkey.
+
 ## How "Open PDFs" detection works
 
 Window titles tell us the *filename* but not the *path*, so resolution happens in tiers:

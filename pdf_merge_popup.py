@@ -26,6 +26,7 @@ import time
 import queue
 import ctypes
 import threading
+import traceback
 
 try:
     import tkinter as tk
@@ -85,13 +86,47 @@ _log_lock = threading.Lock()
 
 
 def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    """Write diagnostics without relying on a console being attached.
+
+    PyInstaller's ``--noconsole`` builds set ``sys.stdout`` to ``None``.  A
+    regular ``print`` therefore raises during startup and terminates the app
+    before tkinter is even created.
+    """
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
         with _log_lock, open(LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:
         pass
-    print(line)
+
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except (AttributeError, OSError):
+            pass
+
+
+def _log_unhandled_exception(kind, value, tb, thread_name=None):
+    """Record otherwise-invisible crashes from a windowed executable."""
+    where = f" in thread {thread_name}" if thread_name else ""
+    log(f"UNHANDLED EXCEPTION{where}:\n" +
+        "".join(traceback.format_exception(kind, value, tb)))
+
+
+def install_exception_logging():
+    """Log main- and worker-thread crashes before Python reports them."""
+    def main_hook(kind, value, tb):
+        _log_unhandled_exception(kind, value, tb)
+
+    def thread_hook(args):
+        _log_unhandled_exception(args.exc_type, args.exc_value, args.exc_traceback,
+                                 args.thread.name)
+
+    sys.excepthook = main_hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = thread_hook
 
 
 # ---------------------------------------------------------------------------
@@ -868,8 +903,11 @@ def main():
         open(LOG_PATH, "w").close()  # fresh log each session
     except OSError:
         pass
+    install_exception_logging()
     log(f"app start · python {sys.version.split()[0]} · frozen="
-        f"{getattr(sys, 'frozen', False)}")
+        f"{getattr(sys, 'frozen', False)} · log={LOG_PATH}")
+    if tk is None:
+        raise RuntimeError("tkinter is unavailable; cannot start the PDF Merge UI")
     root = tk.Tk()
     app = MergeApp(root)
     root.withdraw()  # start hidden in the background
@@ -880,23 +918,34 @@ def main():
         try:
             import keyboard
         except ImportError:
-            events.put("no_keyboard")
+            log("hotkey disabled: keyboard package is not installed")
+            events.put(("no_keyboard", None))
             return
-        keyboard.add_hotkey(HOTKEY, lambda: events.put("show"))
-        keyboard.wait()  # block forever; hotkeys stay registered
+        try:
+            keyboard.add_hotkey(HOTKEY, lambda: events.put(("show", None)))
+            log(f"hotkey registered: {HOTKEY}")
+            keyboard.wait()  # block forever; hotkeys stay registered
+        except Exception as e:
+            log("hotkey thread failed:\n" + traceback.format_exc())
+            events.put(("hotkey_error", str(e)))
 
-    threading.Thread(target=hotkey_thread, daemon=True).start()
+    threading.Thread(target=hotkey_thread, name="pdf-merge-hotkey",
+                     daemon=True).start()
 
     def poll():
         try:
             while True:
-                ev = events.get_nowait()
+                ev, _detail = events.get_nowait()
                 if ev == "show":
                     app.show()
                 elif ev == "no_keyboard":
                     app.show()
                     app.set_status("keyboard lib missing — hotkey disabled "
                                    "(pip install keyboard)")
+                elif ev == "hotkey_error":
+                    app.show()
+                    app.set_status("Hotkey stopped — keep this window open or "
+                                   "see Log for details")
         except queue.Empty:
             pass
         root.after(120, poll)
