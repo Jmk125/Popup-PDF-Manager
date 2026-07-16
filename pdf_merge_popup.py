@@ -57,6 +57,10 @@ FONT_SMALL = ("Segoe UI", 8)
 FONT_TITLE = ("Segoe UI", 12, "bold")
 
 HOTKEY = "ctrl+alt+m"
+HOTKEY_ID = 1
+WM_HOTKEY = 0x0312
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
 
 # Known PDF viewer process names (lowercase) for handle scanning.
 # NOTE: browsers (msedge/chrome/firefox) are deliberately excluded — they hold
@@ -150,6 +154,20 @@ if IS_WINDOWS:
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
                                                  ctypes.POINTER(wintypes.DWORD)]
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
+                                       wintypes.UINT, wintypes.UINT]
+    _user32.RegisterHotKey.restype = wintypes.BOOL
+    _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.UnregisterHotKey.restype = wintypes.BOOL
+
+    class _MSG(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                   ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                   ("time", wintypes.DWORD), ("pt", wintypes.POINT)]
+
+    _user32.GetMessageW.argtypes = [ctypes.POINTER(_MSG), wintypes.HWND,
+                                    wintypes.UINT, wintypes.UINT]
+    _user32.GetMessageW.restype = ctypes.c_int
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +547,11 @@ class MergeApp:
                 self._refresh_done(gen, results, err)
         except queue.Empty:
             pass
-        self.root.after(150, self._poll_scan)
+        except Exception:
+            # Do not let one bad/stale widget result break the polling chain.
+            log("scan-result UI update failed:\n" + traceback.format_exc())
+        finally:
+            self.root.after(150, self._poll_scan)
 
     # -- UI construction ---------------------------------------------------
     def _build_ui(self):
@@ -914,7 +936,40 @@ def main():
 
     events = queue.Queue()
 
-    def hotkey_thread():
+    def native_hotkey_thread():
+        """Use Windows' own hotkey API instead of a low-level hook.
+
+        The keyboard package's hook can stop receiving events after sleep,
+        lock/unlock, or security-software updates.  RegisterHotKey is managed
+        by Windows and delivers WM_HOTKEY to this thread's message queue.
+        """
+        if not _user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT,
+                                     ord("M")):
+            error = ctypes.get_last_error()
+            log(f"native hotkey registration failed; Win32 error={error}")
+            events.put(("hotkey_error", f"Windows error {error}"))
+            return
+        log(f"native hotkey registered: {HOTKEY}")
+        message = _MSG()
+        try:
+            while True:
+                result = _user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result == -1:
+                    error = ctypes.get_last_error()
+                    raise OSError(error, "GetMessageW failed")
+                if result == 0:
+                    log("native hotkey message loop ended")
+                    events.put(("hotkey_error", "Windows message loop ended"))
+                    return
+                if message.message == WM_HOTKEY and message.wParam == HOTKEY_ID:
+                    events.put(("show", None))
+        except Exception as e:
+            log("native hotkey thread failed:\n" + traceback.format_exc())
+            events.put(("hotkey_error", str(e)))
+        finally:
+            _user32.UnregisterHotKey(None, HOTKEY_ID)
+
+    def keyboard_hotkey_thread():
         try:
             import keyboard
         except ImportError:
@@ -925,11 +980,14 @@ def main():
             keyboard.add_hotkey(HOTKEY, lambda: events.put(("show", None)))
             log(f"hotkey registered: {HOTKEY}")
             keyboard.wait()  # block forever; hotkeys stay registered
+            log("keyboard hotkey wait ended")
+            events.put(("hotkey_error", "keyboard listener stopped"))
         except Exception as e:
             log("hotkey thread failed:\n" + traceback.format_exc())
             events.put(("hotkey_error", str(e)))
 
-    threading.Thread(target=hotkey_thread, name="pdf-merge-hotkey",
+    hotkey_target = native_hotkey_thread if IS_WINDOWS else keyboard_hotkey_thread
+    threading.Thread(target=hotkey_target, name="pdf-merge-hotkey",
                      daemon=True).start()
 
     def poll():
@@ -948,7 +1006,13 @@ def main():
                                    "see Log for details")
         except queue.Empty:
             pass
-        root.after(120, poll)
+        except Exception:
+            # This poller is the bridge from the hotkey thread to tkinter.  If
+            # it ever fails, always schedule the next pass so the app cannot
+            # remain hidden with a live but ignored hotkey listener.
+            log("hotkey UI poll failed:\n" + traceback.format_exc())
+        finally:
+            root.after(120, poll)
 
     poll()
     # first launch: show once so you know it's alive

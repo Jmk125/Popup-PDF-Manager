@@ -5,7 +5,7 @@ Hotkey-summoned PDF merge utility. Press **Ctrl+Alt+M** anywhere in Windows and 
 ## Setup (dev / testing)
 
 ```
-pip install pypdf keyboard psutil
+pip install pypdf psutil
 python pdf_merge_popup.py
 ```
 
@@ -24,10 +24,11 @@ Output lands in `dist\PDFMergePopup.exe`. Drop a shortcut in `shell:startup` if 
 
 The windowed build has no console, so startup and hotkey failures are written to
 `pdfmerge_debug.log` beside the executable. Use the **Log** link in the app, or
-open that file directly after a failure. The app now also keeps the window open
-with a status message if Windows or a security policy prevents the `keyboard`
-hook from registering; it does not silently leave you with a hidden window and
-no working hotkey.
+open that file directly after a failure. The Windows build uses the operating
+system's `RegisterHotKey` API rather than a low-level `keyboard` hook, which is
+more resilient after sleep or lock/unlock. If Windows cannot reserve the hotkey,
+the app reopens with a status message instead of silently leaving you with a
+hidden window and no working hotkey.
 
 ## How "Open PDFs" detection works
 
@@ -55,5 +56,5 @@ The same file can be added to the queue multiple times with different ranges (us
 
 ## Notes
 
-- The `keyboard` library registers a global hotkey without admin rights on standard Windows setups. If your work machine's policy blocks low-level keyboard hooks, the app still works — just leave the window open or pin the exe to the taskbar instead of using the hotkey.
+- The Windows build uses the native global-hotkey service and does not need the `keyboard` package. If another app has already reserved **Ctrl+Alt+M**, the app stays visible with an error message; choose a different shortcut by changing `HOTKEY` and the matching virtual key in the source.
 - Password-protected/encrypted PDFs will fail at merge time with a clear error naming the file.
